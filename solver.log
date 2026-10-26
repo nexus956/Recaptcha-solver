@@ -1,0 +1,7 @@
+
+  reCAPTCHA solver running
+  http://localhost:6868/
+
+  types: v2 · v2-invisible · v2-enterprise · v3 · v3-enterprise
+  GET /solve?url=<url>&sitekey=<key>&type=<type>[&action=<action>][&timeout=<s>]
+
