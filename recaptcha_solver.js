@@ -284,8 +284,64 @@ async function extractToken(pg) {
 
 function parseProxy(proxyStr) {
     if (!proxyStr) return undefined;
+    let s = proxyStr.trim();
+    if (!s) return undefined;
+    let protocol = 'http:';
+
+    const protoMatch = s.match(/^([a-zA-Z0-9+.-]+):\/\//);
+    if (protoMatch) {
+        protocol = protoMatch[1].toLowerCase() + ':';
+        s = s.slice(protoMatch[0].length);
+    }
+
+    if (s.includes('@')) {
+        const atIdx = s.lastIndexOf('@');
+        const auth = s.slice(0, atIdx);
+        const hostPort = s.slice(atIdx + 1);
+        const colonIdx = auth.indexOf(':');
+        const cfg = { server: `${protocol}//${hostPort}` };
+        if (colonIdx !== -1) {
+            cfg.username = decodeURIComponent(auth.slice(0, colonIdx));
+            cfg.password = decodeURIComponent(auth.slice(colonIdx + 1));
+        } else {
+            cfg.username = decodeURIComponent(auth);
+        }
+        return cfg;
+    }
+
+    const parts = s.split(':');
+    if (parts.length >= 4) {
+        const isPort1 = /^\d{2,5}$/.test(parts[1]) && parseInt(parts[1], 10) <= 65535;
+        const isPortLast = /^\d{2,5}$/.test(parts[parts.length - 1]) && parseInt(parts[parts.length - 1], 10) <= 65535;
+
+        if (isPort1 && (!isPortLast || parts[0].includes('.') || !parts[parts.length - 2].includes('.'))) {
+            const host = parts[0];
+            const port = parts[1];
+            const user = parts[2];
+            const pass = parts.slice(3).join(':');
+            return {
+                server: `${protocol}//${host}:${port}`,
+                username: user,
+                password: pass
+            };
+        } else if (isPortLast) {
+            const port = parts[parts.length - 1];
+            const host = parts[parts.length - 2];
+            const auth = parts.slice(0, parts.length - 2);
+            return {
+                server: `${protocol}//${host}:${port}`,
+                username: auth[0],
+                password: auth.slice(1).join(':')
+            };
+        }
+    }
+
+    if (parts.length === 2 && /^\d{1,5}$/.test(parts[1])) {
+        return { server: `${protocol}//${parts[0]}:${parts[1]}` };
+    }
+
     try {
-        const u = new URL(proxyStr);
+        const u = new URL(proxyStr.includes('://') ? proxyStr : `${protocol}//${proxyStr}`);
         const cfg = { server: `${u.protocol}//${u.host}` };
         if (u.username) cfg.username = decodeURIComponent(u.username);
         if (u.password) cfg.password = decodeURIComponent(u.password);
@@ -855,6 +911,10 @@ body{font-family:"JetBrains Mono",monospace;background:#0a0a0a;color:#e5e7eb;min
         <input type="text" id="action" placeholder="homepage">
       </div>
     </div>
+    <div class="field">
+      <label><span>Proxy</span><span style="color:#64748b;text-transform:none;font-size:9px">host:port:user:pass or http://</span></label>
+      <input type="text" id="proxy" placeholder="host:port:user:pass or http://user:pass@host:port">
+    </div>
     <div style="font-size:11px;color:#f59e0b;background:#18150d;border:1px solid #3d2f0f;border-radius:6px;padding:8px 12px;margin-bottom:14px;line-height:1.4">
       &#9888; <strong>Production Tip:</strong> For high-volume automated solving, always use a proxy to avoid Google IP rate limits and automated query blocks.
     </div>
@@ -928,6 +988,11 @@ function onType(){
   document.getElementById("actionField").style.display=t.startsWith("v3")?"block":"none";
 }
 
+if(localStorage.getItem("rc_proxy")){
+  const pInput = document.getElementById("proxy");
+  if(pInput) pInput.value = localStorage.getItem("rc_proxy");
+}
+
 document.getElementById("f").addEventListener("submit",async e=>{
   e.preventDefault();
   const btn=document.getElementById("btn"),out=document.getElementById("out"),lbl=document.getElementById("btnLbl");
@@ -941,12 +1006,13 @@ document.getElementById("f").addEventListener("submit",async e=>{
   const type=document.getElementById("type").value;
   const action=document.getElementById("action").value||"homepage";
   const proxy=document.getElementById("proxy")?document.getElementById("proxy").value.trim():"";
+  if(proxy) localStorage.setItem("rc_proxy", proxy);
+  else localStorage.removeItem("rc_proxy");
   let qs="/solve?url="+encodeURIComponent(document.getElementById("url").value)
         +"&sitekey="+encodeURIComponent(document.getElementById("sk").value)
         +"&type="+type;
   if(action&&type.startsWith("v3")) qs+="&action="+encodeURIComponent(action);
   if(proxy) qs+="&proxy="+encodeURIComponent(proxy);
-  if(type.startsWith("v3"))qs+="&action="+encodeURIComponent(action);
   try{
     const r=await fetch(qs),d=await r.json();
     clearInterval(timerInterval);
