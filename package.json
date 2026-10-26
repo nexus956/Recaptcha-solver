@@ -1,0 +1,12 @@
+{
+  "name": "recaptcha-solver",
+  "version": "1.0.0",
+  "main": "recaptcha_solver.js",
+  "scripts": {
+    "start": "node recaptcha_solver.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0",
+    "rebrowser-playwright": "^1.51.1"
+  }
+}
