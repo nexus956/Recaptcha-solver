@@ -1,4 +1,4 @@
-# 🛡️ High-Performance reCAPTCHA Solver & Captcha Inspector
+# 🛡️ reCAPTCHA Solver & Captcha Inspector
 
 A lightweight, production-grade microservice and automated inspector for Google reCAPTCHA (v2 Checkbox, Invisible, Callback, Enterprise, v3, and v3 Enterprise), Cloudflare Turnstile, and hCaptcha.
 

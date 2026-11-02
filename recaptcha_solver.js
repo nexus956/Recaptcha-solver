@@ -1,5 +1,5 @@
 // language: JavaScript (Node.js), file: recaptcha_solver.js, target: Node 18+
-// High-performance reCAPTCHA solver — v2 checkbox, v2 invisible, v2 enterprise,
+// reCAPTCHA solver — v2 checkbox, v2 invisible, v2 enterprise,
 // v3, v3 enterprise. Single /solve endpoint, rebrowser-playwright pool.
 // Audio challenge auto-solver: persistent offline Vosk STT daemon + SoX.
 
