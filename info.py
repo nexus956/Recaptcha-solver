@@ -12,7 +12,7 @@ import sys
 import re
 import json
 import argparse
-import time
+import urllib.parse
 from urllib.parse import urlparse, parse_qs
 
 # Third-party imports
@@ -44,6 +44,88 @@ HEADERS = {
 }
 
 
+def parse_proxy(proxy_str: str) -> dict:
+    """
+    Parses proxy string into:
+    - playwright: { 'server': 'http://...', 'username': '...', 'password': '...' }
+    - requests: { 'http': 'http://...', 'https': 'http://...' }
+    Supports:
+    - host:port:user:pass
+    - user:pass:host:port
+    - user:pass@host:port
+    - http://user:pass@host:port
+    - socks5://...
+    - host:port
+    """
+    if not proxy_str or not proxy_str.strip():
+        return {"playwright": None, "requests": None, "raw": None}
+
+    s = proxy_str.strip()
+    protocol = "http:"
+
+    m = re.match(r"^([a-zA-Z0-9+.-]+)://", s)
+    if m:
+        protocol = m.group(1).lower() + ":"
+        s = s[len(m.group(0)):]
+
+    pw_cfg = {}
+
+    if "@" in s:
+        auth_str, host_port = s.rsplit("@", 1)
+        pw_cfg["server"] = f"{protocol}//{host_port}"
+        if ":" in auth_str:
+            pw_cfg["username"], pw_cfg["password"] = auth_str.split(":", 1)
+        else:
+            pw_cfg["username"] = auth_str
+    else:
+        parts = s.split(":")
+        if len(parts) >= 4:
+            is_port1 = parts[1].isdigit() and 1 <= int(parts[1]) <= 65535
+            is_port_last = parts[-1].isdigit() and 1 <= int(parts[-1]) <= 65535
+            if is_port1 and (not is_port_last or "." in parts[0] or "." not in parts[-2]):
+                host = parts[0]
+                port = parts[1]
+                user = parts[2]
+                password = ":".join(parts[3:])
+                pw_cfg["server"] = f"{protocol}//{host}:{port}"
+                pw_cfg["username"] = user
+                pw_cfg["password"] = password
+            elif is_port_last:
+                port = parts[-1]
+                host = parts[-2]
+                user = parts[0]
+                password = ":".join(parts[1:-2])
+                pw_cfg["server"] = f"{protocol}//{host}:{port}"
+                pw_cfg["username"] = user
+                pw_cfg["password"] = password
+        elif len(parts) == 2 and parts[1].isdigit():
+            pw_cfg["server"] = f"{protocol}//{parts[0]}:{parts[1]}"
+        else:
+            raw_url = proxy_str if "://" in proxy_str else f"{protocol}//{proxy_str}"
+            parsed = urllib.parse.urlparse(raw_url)
+            pw_cfg["server"] = f"{parsed.scheme}://{parsed.hostname}" + (f":{parsed.port}" if parsed.port else "")
+            if parsed.username:
+                pw_cfg["username"] = urllib.parse.unquote(parsed.username)
+            if parsed.password:
+                pw_cfg["password"] = urllib.parse.unquote(parsed.password)
+
+    if "username" in pw_cfg and "password" in pw_cfg:
+        user_enc = urllib.parse.quote(pw_cfg["username"], safe="")
+        pass_enc = urllib.parse.quote(pw_cfg["password"], safe="")
+        server_netloc = pw_cfg["server"].split("://", 1)[1]
+        scheme = pw_cfg["server"].split("://", 1)[0]
+        req_proxy_url = f"{scheme}://{user_enc}:{pass_enc}@{server_netloc}"
+    else:
+        req_proxy_url = pw_cfg.get("server", s)
+
+    req_proxies = {
+        "http": req_proxy_url,
+        "https": req_proxy_url
+    }
+
+    return {"playwright": pw_cfg, "requests": req_proxies, "raw": proxy_str}
+
+
 def normalize_url(raw_url: str) -> str:
     """Ensure URL has a valid http/https scheme."""
     raw = raw_url.strip()
@@ -52,7 +134,7 @@ def normalize_url(raw_url: str) -> str:
     return raw
 
 
-def analyze_static(url: str, timeout: int = 10) -> dict:
+def analyze_static(url: str, timeout: int = 10, proxy_info: dict = None) -> dict:
     """
     Tier 1: Fast static HTML parsing via requests + BeautifulSoup + regex.
     Runs in < 0.5 seconds.
@@ -71,11 +153,16 @@ def analyze_static(url: str, timeout: int = 10) -> dict:
         "element": None,
         "confidence": "low",
         "dynamic_hint": False,
+        "proxy": proxy_info.get("raw") if proxy_info else None,
         "raw_matches": []
     }
 
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        proxies = proxy_info.get("requests") if proxy_info else None
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=timeout, proxies=proxies)
+        except requests.exceptions.SSLError:
+            resp = requests.get(url, headers=HEADERS, timeout=timeout, proxies=proxies, verify=False)
         html = resp.text
         results["final_url"] = resp.url
         soup = BeautifulSoup(html, "html.parser")
@@ -198,7 +285,7 @@ def analyze_static(url: str, timeout: int = 10) -> dict:
     return results
 
 
-def analyze_browser(url: str, timeout: int = 15) -> dict:
+def analyze_browser(url: str, timeout: int = 15, proxy_info: dict = None) -> dict:
     """
     Tier 2: Full dynamic headless browser execution with Playwright.
     Executes JavaScript, intercepts all network calls, and evaluates DOM iframes.
@@ -219,13 +306,21 @@ def analyze_browser(url: str, timeout: int = 15) -> dict:
         "script_url": None,
         "element": None,
         "confidence": "high",
+        "proxy": proxy_info.get("raw") if proxy_info else None,
         "network_matches": []
     }
 
     try:
+        pw_proxy = proxy_info.get("playwright") if proxy_info else None
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=USER_AGENT)
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            )
+            ctx_args = {"user_agent": USER_AGENT}
+            if pw_proxy:
+                ctx_args["proxy"] = pw_proxy
+            context = browser.new_context(**ctx_args)
             page = context.new_page()
 
             network_reqs = []
@@ -262,10 +357,26 @@ def analyze_browser(url: str, timeout: int = 15) -> dict:
             if script_req:
                 results["script_url"] = script_req
 
-            # 2. Inspect DOM attributes
+            # 2. Inspect DOM attributes & SPA Client Storage
             dom_info = page.evaluate("""() => {
                 const el = document.querySelector('[data-sitekey], .g-recaptcha, .cf-turnstile, .h-captcha');
                 const iframes = Array.from(document.querySelectorAll('iframe')).map(f => f.src);
+
+                let storageData = {};
+                try {
+                    for (let i = 0; i < window.localStorage.length; i++) {
+                        const k = window.localStorage.key(i);
+                        const v = window.localStorage.getItem(k);
+                        if (v && (v.includes('recaptcha') || v.includes('turnstile') || v.includes('hcaptcha') || v.includes('sitekey') || v.includes('geetest'))) {
+                            try {
+                                storageData[k] = JSON.parse(v);
+                            } catch {
+                                storageData[k] = v;
+                            }
+                        }
+                    }
+                } catch(e) {}
+
                 return {
                     sitekey: el ? el.getAttribute('data-sitekey') : null,
                     size: el ? el.getAttribute('data-size') : null,
@@ -277,7 +388,8 @@ def analyze_browser(url: str, timeout: int = 15) -> dict:
                     hasGrecaptcha: typeof window.grecaptcha !== 'undefined',
                     hasEnterprise: typeof window.grecaptcha !== 'undefined' && typeof window.grecaptcha.enterprise !== 'undefined',
                     hasTurnstile: typeof window.turnstile !== 'undefined',
-                    hasHcaptcha: typeof window.hcaptcha !== 'undefined'
+                    hasHcaptcha: typeof window.hcaptcha !== 'undefined',
+                    storage: storageData
                 };
             }""")
 
@@ -297,42 +409,81 @@ def analyze_browser(url: str, timeout: int = 15) -> dict:
                 if render_key and render_key != "explicit":
                     sitekey = render_key
 
+            # 3b. Check SPA Storage configs (e.g. OnlyFans initObject)
+            storage = dom_info.get("storage", {}) if dom_info else {}
+            init_val = storage.get("initObject", {}).get("value", {}) if isinstance(storage.get("initObject"), dict) else {}
+            if not isinstance(init_val, dict):
+                init_val = {}
+            if not init_val:
+                for k, v in storage.items():
+                    if isinstance(v, dict):
+                        if any(x in v for x in ["recaptchaEPublic", "recaptchaV3Public", "turnstile", "hCaptchaSiteKey"]):
+                            init_val = v
+                            break
+
+            if init_val:
+                rc_e = init_val.get("recaptchaEPublic")
+                rc_ec = init_val.get("recaptchaECPublic")
+                rc_v3 = init_val.get("recaptchaV3Public")
+                rc_v2 = init_val.get("recaptchaV2Public")
+                turnstile_cfg = init_val.get("turnstile")
+                hcaptcha_key = init_val.get("hCaptchaSiteKey")
+
+                if rc_e or rc_v3 or rc_v2 or rc_ec:
+                    results["system"] = "Google reCAPTCHA Enterprise" if (rc_e or rc_ec) else "Google reCAPTCHA"
+                    results["captcha_type"] = "v3-enterprise" if rc_e else ("v3" if rc_v3 else "v2")
+                    results["found"] = True
+                    sitekey = rc_e or rc_v3 or rc_v2 or rc_ec
+                    results["sitekey"] = sitekey
+                    if rc_ec and rc_e:
+                        results["note"] = f"Enterprise v3 score with v2 checkbox fallback (sitekey: {rc_ec})"
+                    if turnstile_cfg:
+                        t_managed = turnstile_cfg.get('managed') if isinstance(turnstile_cfg, dict) else turnstile_cfg
+                        results["secondary_protection"] = f"Cloudflare Turnstile (Managed: {t_managed})"
+                elif turnstile_cfg:
+                    results["system"] = "Cloudflare Turnstile"
+                    results["captcha_type"] = "turnstile"
+                    results["found"] = True
+                    sitekey = turnstile_cfg.get("managed") if isinstance(turnstile_cfg, dict) else turnstile_cfg
+                    results["sitekey"] = sitekey
+
             # 4. Classify CAPTCHA type
-            if any("qrator" in r or "qauth" in r for r in network_reqs) or (dom_info and ("captcha-input" in str(dom_info) or "qauth" in str(dom_info))):
-                results["system"] = "Qrator Labs (Qauth Anti-Bot WAF)"
-                results["captcha_type"] = "qrator-image-captcha"
-                results["found"] = True
-                results["sitekey"] = "N/A (Session Token / Image Challenge)"
-            elif any("turnstile" in r for r in network_reqs) or (dom_info and dom_info.get("hasTurnstile")):
-                results["system"] = "Cloudflare Turnstile"
-                results["captcha_type"] = "turnstile"
-                results["found"] = True
-            elif any("hcaptcha" in r for r in network_reqs) or (dom_info and dom_info.get("hasHcaptcha")):
-                results["system"] = "hCaptcha"
-                results["captcha_type"] = "hcaptcha"
-                results["found"] = True
-            elif is_enterprise:
-                results["system"] = "Google reCAPTCHA Enterprise"
-                results["found"] = True
-                if render_url and "render=explicit" not in render_url:
-                    results["captcha_type"] = "v3-enterprise"
-                elif (dom_info and dom_info.get("size") == "invisible") or anchor_size == "invisible":
-                    results["captcha_type"] = "v2-enterprise"
-                else:
-                    results["captcha_type"] = "v2-enterprise"
-            elif render_url and "render=explicit" not in render_url:
-                results["system"] = "Google reCAPTCHA"
-                results["captcha_type"] = "v3"
-                results["found"] = True
-            elif anchor_url or (dom_info and dom_info.get("hasGrecaptcha")):
-                results["system"] = "Google reCAPTCHA"
-                results["found"] = True
-                if (dom_info and dom_info.get("size") == "invisible") or anchor_size == "invisible":
-                    results["captcha_type"] = "v2-invisible"
-                elif dom_info and dom_info.get("callback"):
-                    results["captcha_type"] = "v2-callback"
-                else:
-                    results["captcha_type"] = "v2"
+            if not results["found"]:
+                if any("qrator" in r or "qauth" in r for r in network_reqs) or (dom_info and ("captcha-input" in str(dom_info) or "qauth" in str(dom_info))):
+                    results["system"] = "Qrator Labs (Qauth Anti-Bot WAF)"
+                    results["captcha_type"] = "qrator-image-captcha"
+                    results["found"] = True
+                    results["sitekey"] = "N/A (Session Token / Image Challenge)"
+                elif any("turnstile" in r for r in network_reqs) or (dom_info and dom_info.get("hasTurnstile")):
+                    results["system"] = "Cloudflare Turnstile"
+                    results["captcha_type"] = "turnstile"
+                    results["found"] = True
+                elif any("hcaptcha" in r for r in network_reqs) or (dom_info and dom_info.get("hasHcaptcha")):
+                    results["system"] = "hCaptcha"
+                    results["captcha_type"] = "hcaptcha"
+                    results["found"] = True
+                elif is_enterprise:
+                    results["system"] = "Google reCAPTCHA Enterprise"
+                    results["found"] = True
+                    if render_url and "render=explicit" not in render_url:
+                        results["captcha_type"] = "v3-enterprise"
+                    elif (dom_info and dom_info.get("size") == "invisible") or anchor_size == "invisible":
+                        results["captcha_type"] = "v2-enterprise"
+                    else:
+                        results["captcha_type"] = "v2-enterprise"
+                elif render_url and "render=explicit" not in render_url:
+                    results["system"] = "Google reCAPTCHA"
+                    results["captcha_type"] = "v3"
+                    results["found"] = True
+                elif anchor_url or (dom_info and dom_info.get("hasGrecaptcha")):
+                    results["system"] = "Google reCAPTCHA"
+                    results["found"] = True
+                    if (dom_info and dom_info.get("size") == "invisible") or anchor_size == "invisible":
+                        results["captcha_type"] = "v2-invisible"
+                    elif dom_info and dom_info.get("callback"):
+                        results["captcha_type"] = "v2-callback"
+                    else:
+                        results["captcha_type"] = "v2"
 
             results["sitekey"] = sitekey
             results["callback"] = dom_info.get("callback") if dom_info else None
@@ -384,19 +535,32 @@ def print_cli_report(res: dict):
         print(f"  {bold}Badge Size{reset}    : {res.get('size')}")
     if res.get("script_url"):
         print(f"  {bold}Script URL{reset}    : {res.get('script_url')}")
+    if res.get("secondary_protection"):
+        print(f"  {bold}Secondary Sys{reset} : {cyan}{res.get('secondary_protection')}{reset}")
+    if res.get("note"):
+        print(f"  {bold}Config Note{reset}   : {yellow}{res.get('note')}{reset}")
+    if res.get("proxy"):
+        print(f"  {bold}Proxy Used{reset}    : {res.get('proxy')}")
 
     print("-" * 65)
 
-    # Solve command recommendation
+    # Solve API Request
     sk = res.get("sitekey")
     ct = res.get("captcha_type")
     u = res.get("url")
+    proxy_raw = res.get("proxy")
 
     if sk and ct in ["v2", "v2-callback", "v2-invisible", "v2-enterprise", "v3", "v3-enterprise"]:
-        print(f" {bold}Recommended Solve Command:{reset}")
-        print(f"  {green}python3 solve.py -u \"{u}\" -k \"{sk}\" --type \"{ct}\"{reset}")
-        print("\n  Or test single token via REST:")
-        print(f"  curl \"http://localhost:6868/solve?url={u}&sitekey={sk}&type={ct}\"")
+        base_qs = f"url={u}&sitekey={sk}&type={ct}"
+        if res.get("action") and ct.startswith("v3"):
+            base_qs += f"&action={res.get('action')}"
+
+        print(f" {bold}Recommended Solve API Request (Direct):{reset}")
+        print(f"  {green}curl \"http://localhost:6868/solve?{base_qs}\"{reset}")
+
+        proxy_val = proxy_raw if proxy_raw else "<proxy_url>"
+        print(f"\n {bold}With Proxy (Use Good / Residential IP):{reset}")
+        print(f"  {cyan}curl \"http://localhost:6868/solve?{base_qs}&proxy={proxy_val}\"{reset}")
     else:
         print(f" {yellow}[NOTE] This captcha type ({ct}) can be addressed via specialized handler.{reset}")
 
@@ -418,6 +582,12 @@ def parse_args():
         type=str,
         default=None,
         help="Target URL"
+    )
+    parser.add_argument(
+        "-p", "--proxy",
+        type=str,
+        default=None,
+        help="Proxy in host:port:user:pass or http://user:pass@host:port format"
     )
     parser.add_argument(
         "-b", "--browser",
@@ -459,21 +629,22 @@ def main():
         sys.exit(1)
 
     url = normalize_url(target)
+    proxy_info = parse_proxy(args.proxy) if args.proxy else None
 
     # Strategy:
     # 1. If --static is requested, run static only.
     # 2. If --browser is requested, run browser directly.
     # 3. Default: run static first (<0.5s). If dynamic indicators detected or low confidence, run browser.
     if args.static:
-        res = analyze_static(url, timeout=args.timeout)
+        res = analyze_static(url, timeout=args.timeout, proxy_info=proxy_info)
     elif args.browser:
-        res = analyze_browser(url, timeout=args.timeout)
+        res = analyze_browser(url, timeout=args.timeout, proxy_info=proxy_info)
     else:
         # Hybrid smart mode
-        res = analyze_static(url, timeout=args.timeout)
+        res = analyze_static(url, timeout=args.timeout, proxy_info=proxy_info)
         # If static did not find anything, or found dynamic SPA behavior, verify via browser
         if (not res.get("found") or res.get("dynamic_hint")) and PLAYWRIGHT_AVAILABLE:
-            browser_res = analyze_browser(url, timeout=args.timeout)
+            browser_res = analyze_browser(url, timeout=args.timeout, proxy_info=proxy_info)
             if browser_res.get("found"):
                 res = browser_res
 
