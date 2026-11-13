@@ -16,6 +16,20 @@ const readline = require('readline');
 const PORT = process.env.PORT || 6868;
 const POOL = parseInt(process.env.POOL_SIZE || '10', 10);
 const TO = parseInt(process.env.TIMEOUT || '35', 10);
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || String(POOL), 10);
+let solvingCount = 0;
+const solveQueue = [];
+function acquireSlot() {
+    return new Promise(resolve => {
+        if (solvingCount < MAX_CONCURRENT) { solvingCount++; resolve(); }
+        else solveQueue.push(resolve);
+    });
+}
+function releaseSlot() {
+    solvingCount--;
+    const next = solveQueue.shift();
+    if (next) { solvingCount++; next(); }
+}
 
 const TRANSCRIBE_PY = path.join(__dirname, 'transcribe.py');
 const VOSK_PYTHON   = path.join(__dirname, 'venv', 'bin', 'python');
@@ -1088,6 +1102,7 @@ app.get('/solve', async (req, res) => {
     const to = timeout ? parseFloat(timeout) : TO;
     console.log(`[solve] >> ${type} | ${url}`);
 
+    await acquireSlot();
     try {
         let result;
         switch (type) {
@@ -1110,6 +1125,8 @@ app.get('/solve', async (req, res) => {
     } catch (e) {
         console.error(`[solve] << ${type} | EXCEPTION: ${e.message}`);
         res.status(500).json({ success: false, err: e.message });
+    } finally {
+        releaseSlot();
     }
 });
 
