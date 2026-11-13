@@ -497,6 +497,15 @@ async function solveV2(siteUrl, siteKey, invisible, isEnterprise, timeout, proxy
         }
         lastErr = res.err;
 
+        // Fatal errors: without a proxy the exit IP cannot change between
+        // attempts, so retrying only burns the deadline. With a proxy,
+        // rotation gives each retry a fresh IP and is worth it.
+        const fatal = res.err === "blocked_by_google_automated_queries" || res.err === "audio_throttled" || res.err === "google_recaptcha_api_failed_to_load";
+        if (fatal && !proxy) {
+            console.log(`  [v2] attempt ${attempt} fatal (${res.err}) without proxy - failing fast`);
+            break;
+        }
+
         if (Date.now() < dl - 4000) {
             console.log(`  [v2] attempt ${attempt} failed (${res.err}), ${proxy ? 'rotating proxy IP...' : 'retrying...'}`);
             await sleep(100);
@@ -631,6 +640,7 @@ async function solveV2Single(siteUrl, siteKey, invisible, isEnterprise, timeout,
         // Handle audio challenge inside bframe
         if (bframe) {
             let round = 1;
+            let emptyStreak = 0;
             let lastAudioUrl = null;
 
             while (Date.now() < dl - 2000 && round <= 3) {
@@ -708,6 +718,11 @@ async function solveV2Single(siteUrl, siteKey, invisible, isEnterprise, timeout,
                 }
 
                 if (!transcript) {
+                    emptyStreak++;
+                    if (emptyStreak >= 4) {
+                        // 4 silent audios in a row = Google throttling this IP.
+                        return { success: false, err: "audio_throttled" };
+                    }
                     console.log('  [audio] empty transcript, clicking reload button');
                     await bframe.locator('#recaptcha-reload-button').click({ timeout: 3000 }).catch(() => {});
                     round++;
@@ -715,6 +730,7 @@ async function solveV2Single(siteUrl, siteKey, invisible, isEnterprise, timeout,
                     continue;
                 }
 
+                emptyStreak = 0;
                 console.log(`  [audio] transcribed (round ${round}): "${transcript}"`);
                 const input = bframe.locator('#audio-response');
                 await input.fill(transcript, { timeout: 3000 }).catch(() => {});
