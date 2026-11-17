@@ -15,7 +15,7 @@ const readline = require('readline');
 
 const PORT = process.env.PORT || 6868;
 const POOL = parseInt(process.env.POOL_SIZE || '10', 10);
-const TO = parseInt(process.env.TIMEOUT || '35', 10);
+const TO = parseInt(process.env.TIMEOUT || '60', 10);
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || String(POOL), 10);
 let solvingCount = 0;
 const solveQueue = [];
@@ -280,7 +280,7 @@ const ctxPool = [];
 const DEFAULT_PROXY = process.env.PROXY || process.env.HTTP_PROXY || process.env.http_proxy || null;
 
 async function extractToken(pg) {
-    return await pg.evaluate(() => {
+    return await withDeadline(pg.evaluate(() => {
         if (window.__rc_token && window.__rc_token.length > 20) return window.__rc_token;
         try {
             if (typeof grecaptcha !== 'undefined' && typeof grecaptcha.getResponse === 'function') {
@@ -293,7 +293,7 @@ async function extractToken(pg) {
             if (ta && ta.value && ta.value.length > 20) return ta.value;
         } catch(e) {}
         return null;
-    }).catch(() => null);
+    }), 5000, 'extractToken').catch(() => null);
 }
 
 function parseProxy(proxyStr) {
@@ -420,6 +420,11 @@ async function grabCtx(customProxy) {
 
 async function dropCtx(handle) {
     if (!handle || !handle.ctx) return;
+    if (handle.dead) {
+        // context came from a jammed page — kill it, never pool it
+        await withDeadline(handle.ctx.close(), 3000, 'dropCtx').catch(() => {});
+        return;
+    }
     if (handle.isPooled && ctxPool.length < POOL) {
         await handle.ctx.clearCookies().catch(() => {});
         ctxPool.push(handle.ctx);
@@ -454,6 +459,16 @@ async function fastHumanClick(pg, box) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const rand = n => Math.random() * n;
+
+// Hard watchdog: some origins (e.g. www.magnific.com with enterprise.js) can jam
+// the renderer main thread, which hangs pg.evaluate() forever — the request never
+// completes, never hits its deadline, and eats a slot + pooled context. Every
+// page interaction gets raced against a hard cap so a jam is always an error.
+function withDeadline(promise, ms, label) {
+    let t;
+    const guard = new Promise((_, rej) => { t = setTimeout(() => rej(new Error('watchdog:' + label)), ms); });
+    return Promise.race([promise, guard]).finally(() => clearTimeout(t));
+}
 
 // ─── audio challenge solver ───────────────────────────────────────────────────
 
@@ -553,7 +568,11 @@ async function solveV2Single(siteUrl, siteKey, invisible, isEnterprise, timeout,
             return route.continue();
         });
 
-        await pg.goto(siteUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        try {
+            await withDeadline(pg.goto(siteUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }), 20000, 'goto');
+        } catch (e) {
+            return { success: false, err: 'goto_failed: ' + String(e.message || e).slice(0, 100) };
+        }
 
         const dl = t0 + timeout * 1000;
 
@@ -577,14 +596,14 @@ async function solveV2Single(siteUrl, siteKey, invisible, isEnterprise, timeout,
 
                 // If still not rendered after 800ms, actively nudge the render function
                 if (Date.now() - t0 > 800) {
-                    await pg.evaluate(() => window.__rc_render && window.__rc_render()).catch(() => {});
+                    await withDeadline(pg.evaluate(() => window.__rc_render && window.__rc_render()), 5000, 'nudge').catch(() => {});
                 }
 
                 await sleep(40);
             }
 
             if (!anchorFrame) {
-                const hasGrecaptcha = await pg.evaluate(() => typeof grecaptcha !== 'undefined').catch(() => false);
+                const hasGrecaptcha = await withDeadline(pg.evaluate(() => typeof grecaptcha !== 'undefined'), 5000, 'hasgrecaptcha').catch(() => false);
                 return { 
                     success: false, 
                     err: hasGrecaptcha ? 'anchor_frame_not_found' : 'google_recaptcha_api_failed_to_load' 
@@ -617,10 +636,10 @@ async function solveV2Single(siteUrl, siteKey, invisible, isEnterprise, timeout,
             bframe = pg.frames().find(f =>
                 f.url().includes('/bframe') || f.url().includes('/enterprise/bframe'));
             if (bframe) {
-                const blocked = await bframe.evaluate(() => 
+                const blocked = await withDeadline(bframe.evaluate(() => 
                     !!document.querySelector('.rc-doscaptcha-body, .rc-doscaptcha-body-text') || 
                     (document.body && document.body.innerText.includes('automated queries'))
-                ).catch(() => false);
+                ), 5000, 'blockedcheck').catch(() => false);
                 if (blocked) {
                     return { success: false, err: 'blocked_by_google_automated_queries' };
                 }
@@ -661,12 +680,12 @@ async function solveV2Single(siteUrl, siteKey, invisible, isEnterprise, timeout,
                 let mp3Url = null;
                 const audioDeadline = Math.min(dl, Date.now() + 5000);
                 while (Date.now() < audioDeadline) {
-                    const token = await pg.evaluate(() => window.__rc_token).catch(() => null);
+                    const token = await withDeadline(pg.evaluate(() => window.__rc_token), 5000, 'rctoken').catch(() => null);
                     if (token && token.length > 20)
                         return { success: true, token, time: elapsed(t0) };
 
                     const curBframe = pg.frames().find(f => f.url().includes('/bframe') || f.url().includes('/enterprise/bframe')) || bframe;
-                    const bfText = await curBframe.evaluate(() => (document.body ? document.body.innerText : '') + ' ' + (document.title || '')).catch(() => '');
+                    const bfText = await withDeadline(curBframe.evaluate(() => (document.body ? document.body.innerText : '') + ' ' + (document.title || '')), 5000, 'bftext').catch(() => '');
                     if (bfText.includes('automated queries') || bfText.includes('Try again later') || bfText.includes('rc-doscaptcha')) {
                         return { success: false, err: 'blocked_by_google_automated_queries' };
                     }
@@ -687,13 +706,13 @@ async function solveV2Single(siteUrl, siteKey, invisible, isEnterprise, timeout,
                     await sleep(40);
                 }
 
-                const token = await pg.evaluate(() => window.__rc_token).catch(() => null);
+                const token = await withDeadline(pg.evaluate(() => window.__rc_token), 5000, 'rctoken').catch(() => null);
                 if (token && token.length > 20)
                     return { success: true, token, time: elapsed(t0) };
 
                 if (!mp3Url) {
                     const curBframe = pg.frames().find(f => f.url().includes('/bframe') || f.url().includes('/enterprise/bframe')) || bframe;
-                    const bfText = await curBframe.evaluate(() => (document.body ? document.body.innerText : '') + ' ' + (document.title || '')).catch(() => '');
+                    const bfText = await withDeadline(curBframe.evaluate(() => (document.body ? document.body.innerText : '') + ' ' + (document.title || '')), 5000, 'bftext').catch(() => '');
                     if (bfText.includes('automated queries') || bfText.includes('Try again later') || bfText.includes('rc-doscaptcha')) {
                         return { success: false, err: 'blocked_by_google_automated_queries' };
                     }
@@ -816,6 +835,7 @@ async function solveV3Single(siteUrl, siteKey, action, isEnterprise, timeout, pr
     const t0  = Date.now();
     const handle = await grabCtx(proxy);
     const pg  = await handle.ctx.newPage();
+    let jammed = false;
 
     try {
         const html = buildV3Page(siteKey, action || 'homepage', isEnterprise);
@@ -833,13 +853,29 @@ async function solveV3Single(siteUrl, siteKey, action, isEnterprise, timeout, pr
             return route.continue();
         });
 
-        await pg.goto(siteUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        try {
+            await withDeadline(pg.goto(siteUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }), 20000, 'goto');
+        } catch (e) {
+            return { success: false, err: 'goto_failed: ' + String(e.message || e).slice(0, 100) };
+        }
 
         const dl = t0 + timeout * 1000;
         while (Date.now() < dl) {
-            const token = await pg.evaluate(() => window.__rc_token).catch(() => null);
+            let token = null, rcErr = null;
+            try {
+                const st = await withDeadline(
+                    pg.evaluate(() => ({ t: window.__rc_token, e: window.__rc_err || null })),
+                    5000, 'evaluate');
+                token = st && st.t; rcErr = st && st.e;
+            } catch (e) {
+                // renderer jammed (e.g. google enterprise.js spinning) — abort, never pool this ctx
+                jammed = true;
+                return { success: false, err: 'page_jammed: ' + String(e.message || e).slice(0, 100) };
+            }
             if (token && token.length > 20)
                 return { success: true, token, time: elapsed(t0) };
+            if (rcErr)
+                return { success: false, err: 'execute_failed: ' + String(rcErr).slice(0, 120) };
             await sleep(40);
         }
 
@@ -847,7 +883,8 @@ async function solveV3Single(siteUrl, siteKey, action, isEnterprise, timeout, pr
     } catch (e) {
         return { success: false, err: e.message };
     } finally {
-        await pg.close().catch(() => {});
+        handle.dead = jammed;
+        await withDeadline(pg.close(), 3000, 'close').catch(() => {});
         await dropCtx(handle);
     }
 }
